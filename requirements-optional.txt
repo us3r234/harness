@@ -1,0 +1,2 @@
+pywebview>=5   # optional: desktop window (without it, the browser is used)
+graphifyy      # optional: the Map tab (code-only, no AI)

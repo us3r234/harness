@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+errors.log*
+*.bak*
+build/
+dist/
+data/
+credentials.json
+token*.json

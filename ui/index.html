@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Harness</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<aside id="side">
+  <div class="brand"><span class="mark">&#9613;</span>harness</div>
+  <button class="nav" id="nav-overview">
+    <svg viewBox="0 0 16 16"><path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z"/></svg>Overview
+  </button>
+  <button class="nav" id="nav-guide">
+    <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M6.3 6.2a1.8 1.8 0 1 1 2.4 1.7c-.5.2-.7.5-.7 1v.6M8 11.6v.2"/></svg>How it works
+  </button>
+  <div class="filters" id="filters">
+    <button data-f="all" class="on">All</button><button data-f="on">On harness</button><button data-f="work">Needs work</button>
+  </div>
+  <div id="applist"></div>
+  <div class="keys">j/k apps &middot; 1&ndash;9 tabs &middot; n note &middot; g guide &middot; r refresh</div>
+</aside>
+<main id="main"></main>
+<script src="app.js"></script>
+</body>
+</html>
