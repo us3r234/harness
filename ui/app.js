@@ -8,6 +8,7 @@ const post = (p, body) => fetch(p, {method: "POST", headers: {"Content-Type": "a
 let apps = [], allNotes = [], filter = "all", view = "overview", current = null, tab = "timeline", detail = null, sub = null;
 let openRounds = new Set(), sess = null, openSess = new Set();
 let mapData = null, mapSel = null, mapBusy = false, mapOpenAreas = new Set();
+const quiz = {};  // "app|id" -> quiz state (answers live only in this page, never saved)
 let proj = null, mapView = "explore", mapQuery = "", pathFrom = null, pathTo = null, tourIdx = null, tourStep = 0;
 const fnHist = {};  // "app|id" -> git history of that function
 
@@ -33,6 +34,9 @@ const TERMS = {
   turn: ["One message from you plus everything Claude did before answering.", "Your prompt → the tool calls (edits, commands) → Claude's reply."],
   map: ["A picture of the app's code: which pieces exist and which ones use each other.", "Built by graphify in code-only mode: tree-sitter reads the source files on this PC (no AI, no tokens) and records every function and every call between them. Areas are groups of pieces that call each other a lot."],
   hub: ["A piece lots of other code depends on. Change it and many things feel it.", "Ranked by connections: how many distinct pieces it calls plus how many call it (graphify calls these god nodes)."],
+  impact: ["What could change behaviour if you edit this function.", "Everything that calls it, the callers of those, and so on, plus the page code that reaches it through a web request, the addresses and buttons at the top of those chains, and the tests that touch any of them."],
+  clickpath: ["What really happens when someone uses the page: the button, the page code, the web request, the server code, the database.", "Found by reading on*= attributes in HTML and addEventListener / .onclick in JS, then following calls and web requests through the Map."],
+  security: ["Common ways code gets attacked or leaks data, found by reading it.", "SQL built by gluing in values (injection), routes with no login check, shell=True commands, eval, secrets in code, unescaped HTML (XSS), certificate checks off, debug mode, swallowed errors. Leads to check, not proof."],
   explain: ["A plain-English walkthrough of this one function: what it does, step by step, what it needs, how it connects, and what to watch out for.", "Written by Claude from the function's code plus the facts on this card (routes, callers, prerequisites). Only runs when you click, and the answer is saved in <code>data/explain/</code>."],
   trigger: ["What makes this code run.", "Either a web address the app answers (a <b>route</b> like <code>GET /api/probe</code>), or a chain of calls that starts at an entry point."],
   entry: ["Code nothing else in the project calls. Something outside starts it.", "For example <code>main()</code> when the app launches, a click handler, a timer, or the browser requesting a page."],
@@ -362,10 +366,73 @@ const PRE = [  // [key, plain heading, what it means]
   ["timers", "Timing", ""],
 ];
 
+// what depends on this function: callers of callers, the web addresses and page code above them, buttons, tests
+function impactOf(m, fid) {
+  const P = proj && !proj.loading ? proj : null;
+  const pageOf = {};  // handler -> page functions that request it
+  for (const r of (P && P.routes) || []) (pageOf[r.fn] = pageOf[r.fn] || []).push(...r.page);
+  const depth = {[fid]: 0}, q = [fid];
+  while (q.length) {
+    const cur = q.shift();
+    for (const c of [...(m.fns[cur] ? m.fns[cur].callers : []), ...(pageOf[cur] || [])])
+      if (m.fns[c] && !(c in depth)) { depth[c] = depth[cur] + 1; q.push(c); }
+  }
+  delete depth[fid];
+  const ids = Object.keys(depth);
+  const routes = P ? P.routes.filter(r => r.fn === fid || r.fn in depth) : [];
+  const clicks = P ? P.triggers.filter(t => t.fn === fid || t.fn in depth) : [];
+  const tests = P ? [...new Set([fid, ...ids].flatMap(i => P.tests[i] || []))] : [];
+  return {direct: m.fns[fid].callers.filter(c => m.fns[c]), all: ids.sort((a, b) => depth[a] - depth[b]), routes, clicks, tests};
+}
+
+function quizBox(f, key) {
+  const st = quiz[key];
+  if (!st) return `<button class="btn" data-quiz="${esc(f.id)}">Quiz me on it</button>`;
+  if (st.error) return `<div class="notice" style="margin:0">${esc(st.error)}</div> <button class="link" data-quiz="${esc(f.id)}">try again</button>`;
+  if (st.busy) return `<div class="muted">${esc(st.busy)}</div>`;
+  const set = st.stage === "retry" ? st.retry : st.qs;
+  if (st.stage === "ask" || st.stage === "retry") {
+    const i = st.idx, q = set[i];
+    return `<div class="quiz"><div class="qhead">${st.stage === "retry" ? "Second try" : "Quiz"} · question ${i + 1} of ${set.length}</div>
+      <div class="qq">${esc(q.q)}</div>
+      <textarea class="qa" rows="3" placeholder="Answer in your own words. Messy is fine. Ctrl+Enter = next">${esc(st.answers[i] || "")}</textarea>
+      <div class="qbar">${q.hint ? `<button class="link" data-qhint>${st.showHint === i ? esc(q.hint) : "hint"}</button>` : ""}<span class="grow"></span>
+        ${i ? `<button class="btn" data-qprev>Back</button>` : ""}
+        <button class="btn primary" data-qnext>${i < set.length - 1 ? "Next" : "Check my answers"}</button></div></div>`;
+  }
+  const res = st.results || [];
+  const right = res.filter(r => r.verdict === "right").length;
+  return `<div class="quiz"><div class="qhead">${st.stage === "retryresults" ? "Second try" : "Results"}: ${right} of ${res.length} right</div>
+    ${res.map(r => `<div class="qres ${r.verdict}"><div class="qv">${r.verdict === "right" ? "Right" : r.verdict === "partly" ? "Partly" : "Not yet"}</div>
+      <div><div class="qq">${esc(r.q)}</div><div class="qt">${esc(r.teach)}</div>${r.verdict !== "right" ? `<div class="qk"><span>Key idea</span>${esc(r.answer)}</div>` : ""}</div></div>`).join("")}
+    <div class="qbar"><span class="grow"></span>${st.retry && st.retry.length ? `<button class="btn primary" data-qretry>Try the ${st.retry.length} I missed again</button>` : ""}
+      <button class="btn" data-quiz="${esc(f.id)}" data-qfresh>New quiz</button></div></div>`;
+}
+
 // the extra sections: in/out, data, difficulty, errors, tests, todos, history, notes
 function detailSections(m, f, d, key) {
   const sec = (title, body) => `<div class="fsec"><div class="fsl">${title}</div>${body}</div>`;
   let h = "";
+  // impact
+  const imp = impactOf(m, f.id);
+  h += sec(term("impact", "If you change this"), !imp.all.length && !imp.routes.length && !imp.clicks.length
+    ? `<div class="muted">Nothing else in the project depends on it. A change here stays here (but check it still does its own job).</div>`
+    : `<div class="impact">
+        <div><b>${imp.direct.length}</b><span>use it directly</span></div><div><b>${imp.all.length}</b><span>depend on it in total</span></div>
+        <div><b>${imp.routes.length}</b><span>web address${imp.routes.length === 1 ? "" : "es"}</span></div><div><b>${imp.clicks.length}</b><span>button${imp.clicks.length === 1 ? "" : "s"} / event${imp.clicks.length === 1 ? "" : "s"}</span></div>
+        <div><b>${imp.tests.length}</b><span>test file${imp.tests.length === 1 ? "" : "s"}</span></div></div>
+      ${imp.routes.length ? `<div class="io"><div class="ioh">Addresses that could behave differently</div><div>${imp.routes.map(r => `<span class="route"><b>${esc(r.verb)}</b> ${esc(r.path)}</span>`).join(" ")}</div></div>` : ""}
+      ${imp.clicks.length ? `<div class="io"><div class="ioh">What people click that runs it</div><div>${imp.clicks.map(c => `<code>${esc(c.event)}: ${esc(c.element)}</code>`).join(" ")}</div></div>` : ""}
+      ${imp.all.length ? `<div class="io"><div class="ioh">Functions to re-check</div><div>${imp.all.slice(0, 14).map(id => fnLink(m, id)).join(", ")}${imp.all.length > 14 ? ` <span class="faint">+${imp.all.length - 14} more</span>` : ""}</div></div>` : ""}
+      <div class="faint" style="font-size:12px;margin-top:4px">${imp.tests.length ? "Run those tests after changing it." : "No test covers this chain, so check these by hand after a change."}</div>`);
+  // started by (click paths through this function)
+  const P = proj && !proj.loading ? proj : null;
+  if (P) {
+    const via = P.clickpaths.filter(c => c.fn === f.id || c.chains.some(ch => ch.handler === f.id || ch.js.includes(f.id)));
+    if (via.length) h += sec(term("clickpath", "Started by"), via.map(c => `<div class="crow"><span class="ev">${esc(c.event)}</span><span>${esc(c.element)}</span>${c.chains[0] ? `<span class="muted">→ ${esc(c.chains[0].verb)} ${esc(c.chains[0].path)}</span>` : ""}</div>`).join(""));
+    const mine = P.security.filter(s => s.fn === f.id);
+    if (mine.length) h += sec(term("security", "Security"), mine.map(s => `<div class="finding ${s.sev}"><div class="fth"><b>${esc(s.title)}</b><span class="faint mono">line ${s.line} · ${s.sev}</span></div><div class="muted">${esc(s.why)}</div><div class="ffix"><span>Fix</span>${esc(s.fix)}</div></div>`).join(""));
+  }
   // what goes in and out
   const params = d.params || [], req = d.request || {}, rets = d.returns || [];
   const reqNames = {path: "In the address", query: "In the query string (?x=)", json: "In the JSON body", form: "In a form", files: "Uploaded files", headers: "Headers / cookies"};
@@ -446,6 +513,8 @@ function focusCard(m, f) {
     : `<button class="btn primary" data-explain="${esc(f.id)}" ${d ? "" : "disabled"}>Explain this in plain English</button>
        <span class="faint" style="font-size:12px;margin-left:8px">Uses Claude Sonnet, a few cents' worth of tokens. Saved after, so it's paid once.</span>`);
 
+  if (d) html += `<div class="qwrap">${quizBox(f, key)}</div>`;
+
   // how it gets triggered
   if (d) {
     const routes = d.routes || [], reach = d.reach || [];
@@ -496,6 +565,41 @@ function mapSubview(m, P) {
         <td>${inp(r) || `<span class="faint">nothing</span>`}</td>
         <td>${r.reads.length ? `<span class="faint">reads</span> ${r.reads.map(t => `<code>${esc(t)}</code>`).join(" ")}<br>` : ""}${r.writes.length ? `<span class="faint">writes</span> ${r.writes.map(t => `<code class="w">${esc(t)}</code>`).join(" ")}` : ""}${!r.reads.length && !r.writes.length ? `<span class="faint">no SQL tables</span>` : ""}</td>
         <td>${r.page.map(id => fnLink(m, id)).join(", ") || `<span class="faint">not from this code</span>`}</td></tr>`).join("")}</tbody></table>`;
+  }
+  if (mapView === "clicks") {
+    if (!P.clickpaths.length) return `<div class="empty">No buttons or page events wired to this project's functions were found (looked for onclick= in HTML and addEventListener / .onclick in JS).</div>`;
+    return `<div class="sub" style="margin:10px 0">${term("clickpath", "Click paths")}: what really happens when someone uses the page, from the button all the way to the database. Tap any step to open it.</div>
+      ${P.clickpaths.map(c => `<div class="cpath">
+        <div class="cpel"><span class="ev">${esc(c.event)}</span> ${esc(c.element)} <span class="faint mono">${esc(c.file)}:${c.line}</span></div>
+        ${c.chains.length ? c.chains.map(ch => `<div class="cpchain">
+            ${ch.js.map(id => `<span class="cpstep js">${fnLink(m, id)}</span>`).join(`<span class="arrowc">→</span>`)}
+            <span class="arrowc">→</span><span class="cpstep web"><span class="verb ${esc(ch.verb)}">${esc(ch.verb)}</span> <code>${esc(ch.path)}</code></span>
+            <span class="arrowc">→</span><span class="cpstep py">${fnLink(m, ch.handler)}</span>
+            ${ch.reads.length || ch.writes.length ? `<span class="arrowc">→</span><span class="cpstep db">${ch.reads.map(t => `<code>${esc(t)}</code>`).join(" ")}${ch.writes.map(t => `<code class="w">${esc(t)}</code>`).join(" ")}</span>` : ""}
+          </div>`).join("")
+          : `<div class="cpchain"><span class="cpstep js">${fnLink(m, c.fn)}</span><span class="faint" style="margin-left:8px">stays in the page (no server request)</span></div>`}
+      </div>`).join("")}
+      <div class="faint" style="font-size:12px;margin-top:8px">Legend: <span class="cpstep js">page code</span> <span class="cpstep web">web request</span> <span class="cpstep py">server code</span> <span class="cpstep db">tables (amber = changed)</span></div>`;
+  }
+  if (mapView === "data") {
+    if (!P.tables.length) return `<div class="empty">No database tables found. (Looked for SQL in the code and .sql files, and SQLAlchemy models.)</div>`;
+    return `<div class="sub" style="margin:10px 0">The Map turned around: start from the data. Each table, its columns, and everything that reads or changes it.</div>
+      <div class="tables">${P.tables.map(t => `<div class="tbl">
+        <div class="tname"><b>${esc(t.name)}</b><span class="faint">${t.columns.length} column${t.columns.length === 1 ? "" : "s"}</span></div>
+        ${t.columns.length ? `<div class="tcols">${t.columns.map(c => `<code>${esc(c)}</code>`).join(" ")}</div>` : ""}
+        <div class="io"><div class="ioh">Changed by</div><div>${t.writers.map(id => fnLink(m, id)).join(", ") || `<span class="faint">nothing in this code</span>`}${t.routesWrite.length ? `<div class="faint" style="font-size:12px">via ${t.routesWrite.map(esc).join(", ")}</div>` : ""}</div></div>
+        <div class="io"><div class="ioh">Read by</div><div>${t.readers.map(id => fnLink(m, id)).join(", ") || `<span class="faint">nothing in this code</span>`}${t.routesRead.length ? `<div class="faint" style="font-size:12px">via ${t.routesRead.map(esc).join(", ")}</div>` : ""}</div></div>
+      </div>`).join("")}</div>`;
+  }
+  if (mapView === "security") {
+    const sevName = {high: "High", medium: "Medium", low: "Low"};
+    return `<div class="sub" style="margin:10px 0">${term("security", "Security lens")}: risky patterns found by reading the code, each with why it matters and the usual fix. ${P.globalAuth ? "A login check runs before every request (found a before_request hook or login manager), so per-route login warnings are off." : ""} These are leads to check, not proof of a hole.</div>
+      ${P.security.length ? ["high", "medium", "low"].map(sv => {
+        const rows = P.security.filter(s => s.sev === sv);
+        return rows.length ? `<h2 class="sevh2 ${sv}">${sevName[sv]} (${rows.length})</h2>` + rows.map(s => `<div class="finding ${sv}">
+          <div class="fth"><b>${esc(s.title)}</b><span class="faint mono">${fnLink(m, s.fn)}${m.fns[s.fn] && m.fns[s.fn].kind !== "file" ? " · " : ""}${esc((m.fns[s.fn] || {}).file || s.file || "")}:${s.line}</span></div>
+          <div class="muted">${esc(s.why)}</div><div class="ffix"><span>Fix</span>${esc(s.fix)}</div></div>`).join("") : "";
+      }).join("") : `<div class="empty">Nothing risky found by these checks.</div>`}`;
   }
   if (mapView === "tours") {
     if (tourIdx === null) {
@@ -587,7 +691,11 @@ function renderMap(p) {
     api(`/api/project?app=${encodeURIComponent(d.name)}`).then(r => { if (proj && proj.app === d.name) { proj = {...r, app: d.name}; if (tab === "map") renderPane(); } });
   }
   const P = proj && !proj.loading ? proj : null;
+  const hi = P ? P.security.filter(s => s.sev === "high").length : 0;
   const VIEWS = [["explore", "Explore"], ["routes", `Routes${P ? ` <span class="c">${P.routes.length}</span>` : ""}`],
+    ["clicks", `Click paths${P ? ` <span class="c">${P.clickpaths.length}</span>` : ""}`],
+    ["data", `Data${P ? ` <span class="c">${P.tables.length}</span>` : ""}`],
+    ["security", `Security${P ? (hi ? ` <span class="c sevh">${hi} high</span>` : ` <span class="c">${P.security.length}</span>`) : ""}`],
     ["tours", `Tours${P ? ` <span class="c">${P.tours.length}</span>` : ""}`], ["hot", "Hotspots"],
     ["unused", `Possibly unused${P ? ` <span class="c">${P.unused.length}</span>` : ""}`]];
   const head = `
@@ -747,7 +855,7 @@ document.addEventListener("click", async e => {
   const tEl = e.target.closest(".term");
   if (tEl) { e.stopPropagation(); e.preventDefault(); return showTerm(tEl); }
   if (!e.target.closest(".pop")) hideTerm();
-  const t = e.target.closest("[data-app],[data-tab],[data-brief],[data-img],[data-txt],[data-round],[data-kind],[data-save],[data-follow],[data-close],[data-reopen],[data-del],[data-newnote],[data-goproof],[data-gosess],[data-sess],[data-fn],[data-area],[data-explain],[data-mapview],[data-tour],[data-tourstep],[data-tourgo],[data-tourexit],[data-pathfrom],[data-pathto],[data-pathclear],[data-mapfull],[data-mapbuild],#nav-overview,#nav-guide,#filters button,.lightbox");
+  const t = e.target.closest("[data-app],[data-tab],[data-brief],[data-img],[data-txt],[data-round],[data-kind],[data-save],[data-follow],[data-close],[data-reopen],[data-del],[data-newnote],[data-goproof],[data-gosess],[data-sess],[data-fn],[data-area],[data-explain],[data-mapview],[data-tour],[data-tourstep],[data-tourgo],[data-tourexit],[data-pathfrom],[data-pathto],[data-pathclear],[data-quiz],[data-qnext],[data-qprev],[data-qhint],[data-qretry],[data-mapfull],[data-mapbuild],#nav-overview,#nav-guide,#filters button,.lightbox");
   if (!t) return;
   if (t.classList.contains("lightbox")) return t.remove();
   if (t.id === "nav-overview") return go("overview");
@@ -775,6 +883,34 @@ document.addEventListener("click", async e => {
   if (t.dataset.tourstep) { tourStep += +t.dataset.tourstep; renderPane(); $(".tourbar")?.scrollIntoView({block: "nearest"}); return; }
   if (t.dataset.tourgo) { tourStep = +t.dataset.tourgo; return renderPane(); }
   if (t.hasAttribute("data-tourexit")) { tourIdx = null; return renderPane(); }
+  if (t.dataset.quiz) {
+    const id = t.dataset.quiz, app = current, k = `${app}|${id}`;
+    if (t.hasAttribute("data-qfresh")) delete quiz[k];
+    quiz[k] = {busy: "Claude is writing 3 questions about this function… (about 15–30 seconds)"}; renderPane();
+    const r = await post("/api/fn/quiz", {app, id});
+    quiz[k] = r.error ? {error: r.error} : {stage: "ask", qs: r.questions, idx: 0, answers: []};
+    if (current === app) renderPane();
+    return;
+  }
+  if (t.hasAttribute("data-qnext") || t.hasAttribute("data-qprev") || t.hasAttribute("data-qhint") || t.hasAttribute("data-qretry")) {
+    const k = `${current}|${mapSel}`, st = quiz[k];
+    if (!st) return;
+    const ta = $(".quiz .qa");
+    if (ta) st.answers[st.idx] = ta.value;
+    if (t.hasAttribute("data-qhint")) { st.showHint = st.idx; return renderPane(); }
+    if (t.hasAttribute("data-qprev")) { st.idx--; return renderPane(); }
+    if (t.hasAttribute("data-qretry")) { Object.assign(st, {stage: "retry", idx: 0, answers: [], showHint: null}); renderPane(); $(".quiz .qa")?.focus(); return; }
+    const set = st.stage === "retry" ? st.retry : st.qs;
+    if (st.idx < set.length - 1) { st.idx++; st.showHint = null; renderPane(); $(".quiz .qa")?.focus(); return; }
+    const retry = st.stage === "retry", app = current, id = mapSel;
+    st.busy = "Checking your answers…"; renderPane();
+    const r = await post("/api/fn/quiz/grade", {app, id, answers: set.map((_, i) => st.answers[i] || ""), retry});
+    st.busy = null;
+    if (r.error) st.error = r.error;
+    else Object.assign(st, {stage: retry ? "retryresults" : "results", results: r.results, retry: r.retry, answers: []});  // answers dropped once graded
+    if (current === app) renderPane();
+    return;
+  }
   if (t.dataset.pathfrom) { pathFrom = t.dataset.pathfrom; renderPane(); $(".pathbox")?.scrollIntoView({block: "nearest", behavior: "smooth"}); return; }
   if (t.dataset.pathto) { pathTo = t.dataset.pathto; renderPane(); $(".pathbox")?.scrollIntoView({block: "nearest", behavior: "smooth"}); return; }
   if (t.hasAttribute("data-pathclear")) { pathFrom = pathTo = null; return renderPane(); }
@@ -831,6 +967,7 @@ document.addEventListener("keydown", e => {
       e.preventDefault();
       const c = e.target.closest(".composer"), f = e.target.closest(".fbox");
       if (c) saveComposer(c); else if (f) $("[data-fsave]", f).click();
+      else if (e.target.matches(".qa")) $(".quiz [data-qnext]")?.click();
     }
     if (e.key === "Escape") e.target.blur();
     return;

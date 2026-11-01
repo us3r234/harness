@@ -262,6 +262,16 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("status") not in ("open", "done"):
                     return self.send(400, json.dumps({"error": "bad status"}))
                 return self.send(200, json.dumps(notes.set_status(int(body["id"]), body["status"])))
+            if path in ("/api/fn/quiz", "/api/fn/quiz/grade"):  # costs tokens: only on an explicit click
+                apps_ = dict(harness.apps())
+                m = maps.load(body.get("app", "")) if body.get("app") in apps_ else None
+                d = explain.detail(body["app"], apps_[body["app"]], m, body.get("id", "")) if m else None
+                if not d or "error" in d:
+                    return self.send(404, json.dumps({"error": "not found"}))
+                if path == "/api/fn/quiz":
+                    return self.send(200, json.dumps(explain.quiz_make(body["app"], m, body["id"], d)))
+                return self.send(200, json.dumps(explain.quiz_grade(body["app"], m, body["id"], d, body.get("answers") or [],
+                                                                     "retry" if body.get("retry") else "questions")))
             if path == "/api/fn/explain":  # costs tokens: only ever runs on an explicit click
                 apps_ = dict(harness.apps())
                 m = maps.load(body.get("app", "")) if body.get("app") in apps_ else None

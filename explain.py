@@ -190,6 +190,88 @@ def _rate(score, lines, nest):
     return "very complex", "So many paths that it's hard to hold in your head. A good candidate to split into smaller functions."
 
 
+# ---------------------------------------------------------------- python: security lens
+SECRET_NAME = re.compile(r"(pass(word|wd)?|secret(_?key)?|api_?key|token|private_?key|client_?secret|auth_?key|access_?key|secret_?token)$", re.I)
+EXEC_CALLS = {"execute", "executemany", "executescript", "raw", "text", "read_sql", "read_sql_query"}
+
+
+def _finding(sev, kind, title, why, fix, line):
+    return {"sev": sev, "kind": kind, "title": title, "why": why, "fix": fix, "line": line}
+
+
+def _is_dynamic_sql(arg):
+    """An SQL string built by gluing values in (f-string, +, %, .format) instead of using ? / %s placeholders."""
+    if isinstance(arg, ast.JoinedStr):
+        lit = "".join(p.value for p in arg.values if isinstance(p, ast.Constant))
+        return bool(SQL_RE.search(lit)) and any(isinstance(p, ast.FormattedValue) for p in arg.values)
+    if isinstance(arg, ast.BinOp) and isinstance(arg.op, (ast.Add, ast.Mod)):
+        s = ast.unparse(arg)
+        return bool(SQL_RE.search(s))
+    if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute) and arg.func.attr == "format":
+        return bool(SQL_RE.search(ast.unparse(arg.func.value)))
+    return False
+
+
+def _py_security(node, routes, req):
+    out, sql_vars = [], {}
+    for n in ast.walk(node):  # remember q = f"SELECT ... {x}" so execute(q) is caught too
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and _is_dynamic_sql(n.value):
+            sql_vars[n.targets[0].id] = n.lineno
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call):
+            f = n.func
+            fname = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+            full = ast.unparse(f)
+            kw = {k.arg: k.value for k in n.keywords if k.arg}
+            if fname in EXEC_CALLS and n.args:
+                a0 = n.args[0]
+                if _is_dynamic_sql(a0) or (isinstance(a0, ast.Name) and a0.id in sql_vars):
+                    out.append(_finding("high", "sql-injection", "SQL built by gluing values into the text",
+                        "If any of those values come from a user (a form, the URL, a ticket), they can rewrite the query: read other people's data, or delete tables. This is SQL injection.",
+                        "Use placeholders and pass the values separately: execute(\"SELECT * FROM users WHERE id = ?\", (user_id,)).", n.lineno))
+            if full.startswith("subprocess.") and isinstance(kw.get("shell"), ast.Constant) and kw["shell"].value is True:
+                dyn = n.args and not isinstance(n.args[0], ast.Constant)
+                out.append(_finding("high" if dyn else "medium", "shell", "Runs a command through the shell (shell=True)",
+                    "The shell reads special characters like ; | &&. If part of the command comes from input, someone can tack on their own command.",
+                    "Pass a list instead: subprocess.run([\"ping\", \"-n\", \"1\", host]) with no shell=True.", n.lineno))
+            if full in ("os.system", "os.popen"):
+                out.append(_finding("medium", "shell", f"{full}() runs a shell command",
+                    "Same risk as shell=True: the whole string goes through the shell.", "Use subprocess.run([...]) with a list of arguments.", n.lineno))
+            if fname in ("eval", "exec") and isinstance(f, ast.Name):
+                out.append(_finding("high", "eval", f"{fname}() runs text as Python code",
+                    "Whoever controls that text controls the program.", "Parse the data instead (json.loads, int(), a lookup table).", n.lineno))
+            if full in ("pickle.loads", "pickle.load", "marshal.loads"):
+                out.append(_finding("medium", "deserialize", f"{full}() on data",
+                    "Unpickling data from an untrusted source can run code.", "Use JSON for anything that crosses a trust boundary.", n.lineno))
+            if full in ("yaml.load",) and "Loader" not in kw:
+                out.append(_finding("medium", "deserialize", "yaml.load() without a safe loader",
+                    "The default loader can build arbitrary Python objects.", "Use yaml.safe_load().", n.lineno))
+            if isinstance(kw.get("verify"), ast.Constant) and kw["verify"].value is False:
+                out.append(_finding("medium", "tls", "HTTPS certificate checking turned off (verify=False)",
+                    "Anyone between this machine and the server can read or change the traffic.", "Remove verify=False; if it's an internal CA, point verify= at the CA file.", n.lineno))
+            if fname == "run" and isinstance(kw.get("debug"), ast.Constant) and kw["debug"].value is True:
+                out.append(_finding("medium", "debug", "Debug mode is on (debug=True)",
+                    "Flask's debugger lets anyone who can reach the page run code on the server.", "Turn it off outside your own PC: debug=False, or read it from an environment variable.", n.lineno))
+            if fname in ("open", "send_file", "send_from_directory") and req and n.args:
+                arg = ast.unparse(n.args[0])
+                if any(k in arg for vals in req.values() for k in vals) or "request." in arg:
+                    out.append(_finding("medium", "path", "Opens a file whose name comes from the request",
+                        "A name like ../../secrets.txt can reach files outside the intended folder (path traversal).",
+                        "Only allow known names, or use werkzeug's safe_join / check the resolved path stays inside the folder.", n.lineno))
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                name = t.id if isinstance(t, ast.Name) else t.attr if isinstance(t, ast.Attribute) else _const_str(t.slice) if isinstance(t, ast.Subscript) else ""
+                if name and SECRET_NAME.search(name) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str) and len(n.value.value) >= 6:
+                    out.append(_finding("high", "secret", f"A secret is written into the code ({name})",
+                        "Anyone who can read the code (or the git history, forever) has it.", "Read it from an environment variable or a config file that's not in git, then change the secret.", n.lineno))
+        if isinstance(n, ast.ExceptHandler):
+            swallow = all(isinstance(s, (ast.Pass, ast.Continue)) or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)) for s in n.body)
+            if swallow and (n.type is None or ast.unparse(n.type) in ("Exception", "BaseException")):
+                out.append(_finding("low", "swallow", "Errors are silently ignored",
+                    "If something fails here, nothing is logged and nobody finds out, so bugs (and attacks) go unnoticed.", "Catch the specific error you expect, and log anything else.", n.lineno))
+    return out
+
+
 def _py_extras(node, lines, routes):
     params = []
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -280,7 +362,13 @@ def _py_extras(node, lines, routes):
     body = lines[node.lineno - 1:node.end_lineno]
     todos = [{"line": node.lineno + i, "text": m.group(0).strip()} for i, l in enumerate(body)
              for m in [re.search(r"#\s*(TODO|FIXME|HACK|XXX|BUG)\b.*", l)] if m]
+    decorators = [ast.unparse(dd.func if isinstance(dd, ast.Call) else dd) for dd in getattr(node, "decorator_list", [])]
+    body_text = "\n".join(body)
+    auth_hint = bool(re.search(r"current_user|login_required|session\[|session\.get|g\.user|request\.authorization|"
+                               r"verify_(?:token|jwt|password)|check_(?:auth|login|permission)|is_authenticated|abort\(\s*40[13]",
+                               body_text))
     return {"params": params, "request": req, "returns": rets[:6], "codes": sorted(codes), "yields": yields,
+            "decorators": decorators, "authHint": auth_hint, "security": _py_security(node, routes, req),
             "data": {"reads": sorted(reads), "writes": sorted(writes)} if reads or writes else {},
             "errors": {"raises": sorted(raises), "catches": sorted(catches), "bare": bare},
             "complexity": {"score": score, "lines": length, "nesting": nest, "params": len(params), "label": label, "why": why},
@@ -425,6 +513,25 @@ def _js_detail(src, name, line):
     label, why = _rate(score, len(body), max(0, nest - 1))
     todos = [{"line": line + i, "text": m.group(0).strip()} for i, l in enumerate(body)
              for m in [re.search(r"//\s*(TODO|FIXME|HACK|XXX|BUG)\b.*", l)] if m]
+    security = []
+    # text dropped into the page as HTML without escaping (XSS): innerHTML = `...${x}...`
+    for i, l in enumerate(body):
+        if re.search(r"\.(innerHTML|outerHTML)\s*[+]?=|insertAdjacentHTML\(", l):
+            chunk = "\n".join(body[i:i + 8])
+            raw = [e for e in re.findall(r"\$\{\s*([^}]+?)\s*\}", chunk)
+                   if not re.match(r"(esc|escape|escapeHtml|encode\w*|Number|parseInt|fmt\w*|String\(\s*\d|\w+\.length|\d)", e)
+                   and re.search(r"[a-z_]\w*\.\w+|\[\w+\]", e)
+                   # only text-like fields: where someone's typed words could end up (numbers and ids can't carry HTML)
+                   and re.search(r"(name|title|summary|subject|text|body|label|desc\w*|message|msg|note|comment|from|to|email|user\w*|query|search|value|content|html|snippet)\b", e, re.I)]
+            if raw:
+                security.append({"sev": "medium", "kind": "xss", "title": "Puts data into the page as HTML without escaping it",
+                                 "why": f"If a value like {raw[0][:40]} ever holds text someone typed (a ticket, a name), it can contain <script> or an onerror= trick and run in everyone's browser (cross-site scripting).",
+                                 "fix": "Escape it first (a small esc() that replaces & < > \" ), or set .textContent instead of innerHTML.",
+                                 "line": line + i})
+                break
+    if re.search(r"\beval\(|new Function\(", code_only):
+        security.append({"sev": "high", "kind": "eval", "title": "Runs text as code (eval / new Function)",
+                         "why": "Whoever controls that text controls the page.", "fix": "Parse data with JSON.parse instead.", "line": line})
     rets = []
     for r in re.findall(r"\breturn\s+([^;\n]+)", text):
         if r.strip() not in rets:
@@ -432,6 +539,7 @@ def _js_detail(src, name, line):
     return {"start": line, "end": end, "sig": sig, "doc": " ".join(d for d in doc if d).strip(),
             "routes": [], "pre": {k: v for k, v in pre.items() if v}, "lang": "javascript",
             "params": params, "request": {}, "returns": rets[:6], "codes": [], "yields": False, "data": {},
+            "decorators": [], "authHint": False, "security": security,
             "errors": {"raises": sorted(set(re.findall(r"throw new (\w+)", text))), "catches": ["error"] if "catch" in code_only else [], "bare": False},
             "complexity": {"score": score, "lines": len(body), "nesting": max(0, nest - 1), "params": len(params), "label": label, "why": why},
             "todos": todos}
@@ -558,6 +666,124 @@ Source:
 ```
 {code}
 ```"""
+
+
+def _claude(prompt, system, model=None):
+    """One tool-less, non-persisted Claude call. Returns (text, usage dict) or raises RuntimeError."""
+    args = ["claude", "-p", "--model", model or MODEL, "--output-format", "json", "--no-session-persistence",
+            "--strict-mcp-config", "--tools", "", "--system-prompt", system]
+    try:
+        r = subprocess.run(args, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=180, creationflags=NO_WINDOW, cwd=HERE)
+        out = json.loads(r.stdout)
+    except FileNotFoundError:
+        raise RuntimeError("The `claude` command isn't installed here, so this needs Claude Code.")
+    except (subprocess.TimeoutExpired, ValueError) as e:
+        raise RuntimeError(f"Claude didn't answer ({type(e).__name__}).")
+    if out.get("is_error"):
+        raise RuntimeError(str(out.get("result"))[:300])
+    return out.get("result", ""), out.get("usage", {})
+
+
+def _json_block(text):
+    m = re.search(r"\{[\s\S]*\}", text or "")
+    if not m:
+        raise RuntimeError("Claude's answer wasn't in the expected format. Try again.")
+    return json.loads(m.group(0))
+
+
+def _facts(m, fn_id, d):
+    f = m["fns"][fn_id]
+    lab = lambda i: m["fns"][i]["label"] if i in m["fns"] else i
+    return (f"Function: {f['label']} ({f['file']} lines {d['start']}-{d['end']})\nDocstring: {d['doc'] or '(none)'}\n"
+            f"Triggered by routes: {', '.join(d['routes']) or '(none)'}\n"
+            f"Reached from: {' | '.join(' -> '.join(lab(i) for i in ch) for ch in d['reach']) or '(entry point)'}\n"
+            f"Called by: {', '.join(lab(i) for i in f['callers'][:10]) or '(none)'}\nCalls: {', '.join(lab(i) for i in f['calls'][:12]) or '(none)'}\n"
+            f"Inputs: {json.dumps(d.get('params', []))} request: {json.dumps(d.get('request', {}))}\n"
+            f"Tables: {json.dumps(d.get('data', {}))}\nPrerequisites: {json.dumps(d['pre'])}\n\nSource:\n```\n"
+            + "\n".join(l for _, l in d["code"])[:10000] + "\n```")
+
+
+def _quiz_path(app, fn_id):
+    return os.path.join(CACHE, app, re.sub(r"[^\w.-]", "_", fn_id) + ".quiz.json")
+
+
+QUIZ_PROMPT = """Write a short quiz that checks whether a learner UNDERSTANDS this function (not trivia, not syntax).
+Ask exactly 3 questions, in this order: (1) what it does / why the app needs it, (2) what triggers it or what it
+depends on, (3) what happens in a specific situation (an edge case, a failure, or a change). Each answerable in one
+or two sentences from the code and facts below. Plain words, no jargon the code doesn't use.
+
+Reply with ONLY this JSON:
+{{"questions": [{{"q": "...", "answer": "the key idea a good answer must contain", "hint": "one-line nudge"}}, ...]}}
+
+{facts}"""
+
+GRADE_PROMPT = """Grade a learner's answers about one function. Be fair about wording: an answer is right if it has
+the key idea, even phrased loosely. For each answer give:
+- "verdict": "right" | "partly" | "wrong"
+- "teach": 1-3 sentences that state the CORRECT idea plainly, plus the one detail that separates it from a common
+  confusion. Never quote or restate the learner's wrong answer.
+- "retry": for "partly"/"wrong" only, ONE new question that checks the same idea from a different angle, with its
+  "retry_answer" (the key idea). Empty strings when right.
+
+Reply with ONLY this JSON:
+{{"results": [{{"verdict": "...", "teach": "...", "retry": "...", "retry_answer": "..."}}, ...]}}
+
+Questions, expected key ideas, and the learner's answers:
+{qa}
+
+Facts about the function:
+{facts}"""
+
+
+def quiz_make(app, m, fn_id, d):
+    """3 questions (answers stay on the server). Cached per version of the code."""
+    path = _quiz_path(app, fn_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            st = json.load(fh)
+        if st.get("code_hash") == _hash(d) and st.get("questions"):
+            return {"questions": [{"q": q["q"], "hint": q.get("hint", "")} for q in st["questions"]], "cached": True}
+    except (OSError, ValueError):
+        pass
+    try:
+        text, u = _claude(QUIZ_PROMPT.format(facts=_facts(m, fn_id, d)),
+                          "You write fair, concept-level quiz questions about source code. Output only JSON.")
+        qs = [q for q in _json_block(text).get("questions", []) if q.get("q") and q.get("answer")][:3]
+    except (RuntimeError, ValueError) as e:
+        return {"error": str(e)}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:  # questions + expected ideas only; the learner's answers are never stored
+        json.dump({"code_hash": _hash(d), "questions": qs, "retry": []}, fh, ensure_ascii=False)
+    return {"questions": [{"q": q["q"], "hint": q.get("hint", "")} for q in qs], "out": u.get("output_tokens", 0)}
+
+
+def quiz_grade(app, m, fn_id, d, answers, which="questions"):
+    """Grade answers to the main set or the retry set; new retry questions replace the old ones."""
+    path = _quiz_path(app, fn_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        return {"error": "Start the quiz first."}
+    qs = st.get(which) or []
+    if not qs or len(answers) != len(qs):
+        return {"error": "The questions changed. Start the quiz again."}
+    qa = "\n".join(f"{i + 1}. Q: {q['q']}\n   Key idea: {q['answer']}\n   Learner: {(a or '').strip() or '(left blank)'}"
+                   for i, (q, a) in enumerate(zip(qs, answers)))
+    try:
+        text, u = _claude(GRADE_PROMPT.format(qa=qa, facts=_facts(m, fn_id, d)),
+                          "You are a kind, exact tutor grading short answers about code. Output only JSON.")
+        res = _json_block(text).get("results", [])[:len(qs)]
+    except (RuntimeError, ValueError) as e:
+        return {"error": str(e)}
+    st["retry"] = [{"q": r["retry"], "answer": r.get("retry_answer", "")} for r in res
+                   if r.get("verdict") in ("partly", "wrong") and r.get("retry")]
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, ensure_ascii=False)
+    return {"results": [{"q": q["q"], "verdict": r.get("verdict", "wrong"), "teach": r.get("teach", ""), "answer": q["answer"]}
+                        for q, r in zip(qs, res)],
+            "retry": [{"q": r["q"]} for r in st["retry"]], "out": u.get("output_tokens", 0)}
 
 
 def explain(app, m, fn_id, d):

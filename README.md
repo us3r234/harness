@@ -85,6 +85,22 @@ Static analysis is best for Python. JavaScript gets a lighter pass.
 - **Possibly unused**: nothing calls it, it isn't a route or an entry point, and its name appears
   nowhere else.
 - **Search** (`/`) and **path finder**: how does A reach B, including page → server web requests.
+- **Click paths**: what happens when someone uses the page, from the button (HTML `onclick=` or JS
+  `addEventListener` / `.onclick`) through the page code and the web request to the server handler and
+  the tables it reads or changes.
+- **Data**: the Map turned around. Every table, its columns (from `CREATE TABLE`, `INSERT`/`UPDATE`
+  column lists, or SQLAlchemy models), and every function and route that reads or changes it.
+- **Security**: risky patterns, each with why it matters and the usual fix. Covers SQL built by gluing in
+  values (injection), Flask/FastAPI routes with no visible login check (off when a `before_request` hook
+  or login manager is present), `shell=True` / `os.system`, `eval`, unsafe `pickle`/`yaml`, secrets
+  written into code, `debug=True`, `verify=False`, file paths taken from the request, unescaped HTML in
+  the page (XSS), and swallowed errors. These are leads to check, not proof.
+
+Each function card also has **If you change this** (everything that depends on it, up through the
+web addresses and buttons, plus the tests that cover that chain), **Started by** (the buttons that lead
+to it), its security findings, and **Quiz me** (optional, Claude Code CLI): three understanding
+questions, feedback that teaches the key idea, and fresh retry questions for anything missed. Answers
+are never saved.
 
 ## The docs convention (optional)
 
